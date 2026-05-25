@@ -1,0 +1,13 @@
+{
+  "name": "invoice-explainer",
+  "version": "1.0.0",
+  "description": "Invoice extraction and explanation pipeline using Claude API",
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.39.0"
+  }
+}
