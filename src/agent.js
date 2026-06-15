@@ -1,8 +1,41 @@
+/**
+ * agent.js
+ *
+ * Agentic invoice explainer with:
+ * - Two CRM tools (lookup_customer, lookup_billing_address)
+ * - Streaming responses
+ * - API error handling (Fix #1)
+ * - Invoice number validation (Fix #3)
+ * - Debug logging to logs/ folder
+ * - Prompt caching markers
+ * - Human-in-the-loop when CRM returns { found: false }
+ */
+
 const Anthropic = require("@anthropic-ai/sdk");
+const readline = require("readline");
 const { executeTool } = require("./mock-crm");
 const { Logger } = require("./logger");
 
 const client = new Anthropic();
+
+// ─── Human input helper ───────────────────────────────────────────────────────
+// Pauses the agent loop and waits for the user to type something.
+// Returns a Promise that resolves when the user presses Enter.
+
+function askUser(question) {
+  return new Promise((resolve) => {
+    const rl = readline.createInterface({
+      input: process.stdin,
+      output: process.stdout,
+    });
+    rl.question(question, (answer) => {
+      rl.close();
+      resolve(answer);
+    });
+  });
+}
+
+// ─── Tool definitions ─────────────────────────────────────────────────────────
 
 const TOOLS = [
   {
@@ -33,17 +66,31 @@ const TOOLS = [
         },
       },
       required: ["invoice_number"],
-      cache_control: { type: "ephemeral" },
+      // Cache marker: cache everything up to and including tools
+      // (system prompt + tools are static — messages change every iteration)
     },
+    cache_control: { type: "ephemeral" },
   },
 ];
 
-const SYSTEM_PROMPT = `You are an invoice analysis agent. Your job is to:
+// ─── System prompt ────────────────────────────────────────────────────────────
+// Array format required for cache_control support
+
+const SYSTEM_PROMPT = [
+  {
+    type: "text",
+    text: `You are an invoice analysis agent. Your job is to:
 1. Analyse the invoice provided by the user
 2. Identify any missing critical fields: customer name, billing address
 3. Use the available tools to look up missing information from the CRM
 4. Once you have all available information, produce a clear plain-language explanation of the invoice
-5. If a tool returns { found: false }, clearly flag to the user what is missing and cannot be resolved — do not guess or invent data`;
+5. If a tool returns { found: false }, clearly flag to the user what is missing and cannot be resolved — do not guess or invent data
+If a tool result contains source: "human_input", that field was provided manually by a human operator — not retrieved from the CRM. Make this distinction clear in your explanation.`,
+  },
+];
+
+// ─── Invoice number validation ────────────────────────────────────────────────
+// Fix #3: Claude extracts the invoice number — validate before hitting the CRM
 
 const INVOICE_NUMBER_FORMAT = /^INV-\d+$/;
 
@@ -51,6 +98,8 @@ function validateInvoiceNumber(invoiceNumber) {
   if (!invoiceNumber) return false;
   return INVOICE_NUMBER_FORMAT.test(invoiceNumber);
 }
+
+// ─── Agent loop ───────────────────────────────────────────────────────────────
 
 async function runAgent(invoiceText) {
   console.log("\n" + "═".repeat(50));
@@ -68,7 +117,6 @@ async function runAgent(invoiceText) {
     console.log(`\n── Loop iteration ${iteration} ──`);
     logger.logIteration(iteration);
 
-    // Log exactly what we're about to send
     logger.logRequest({
       model: "claude-sonnet-4-6",
       system: SYSTEM_PROMPT,
@@ -76,6 +124,7 @@ async function runAgent(invoiceText) {
       messages,
     });
 
+    // Fix #1: try/catch around API call
     let response;
     try {
       const stream = client.messages.stream({
@@ -99,11 +148,10 @@ async function runAgent(invoiceText) {
       };
     }
 
-    // Log exactly what came back
     logger.logResponse(response);
-
     console.log(`\nstop_reason: ${response.stop_reason}`);
 
+    // ── EXIT CONDITION 1: Claude is done ──────────────────────────────────
     if (response.stop_reason === "end_turn") {
       const finalText = response.content
         .filter((b) => b.type === "text")
@@ -116,6 +164,7 @@ async function runAgent(invoiceText) {
       return outcome;
     }
 
+    // ── TOOL USE: Claude wants to call a tool ─────────────────────────────
     if (response.stop_reason === "tool_use") {
       messages.push({ role: "assistant", content: response.content });
 
@@ -128,6 +177,7 @@ async function runAgent(invoiceText) {
 
           const invoiceNumber = block.input.invoice_number;
 
+          // Fix #3: validate invoice number format before hitting CRM
           if (!validateInvoiceNumber(invoiceNumber)) {
             console.log(`   ⚠️  Invalid invoice number: "${invoiceNumber}" — skipping CRM call`);
             toolResults.push({
@@ -138,8 +188,33 @@ async function runAgent(invoiceText) {
               }),
             });
           } else {
-            const result = executeTool(block.name, block.input);
+            // Invoice number valid — hit the CRM
+            let result = executeTool(block.name, block.input);
             console.log(`   Result: ${JSON.stringify(result)}`);
+
+            // HUMAN-IN-THE-LOOP: CRM returned nothing — ask the user
+            if (!result.found) {
+              if (block.name === "lookup_customer") {
+                const answer = await askUser(
+                  `\n⚠️  Customer not found in CRM for ${invoiceNumber}.\n   Enter customer name manually (or press Enter to skip): `
+                );
+                if (answer.trim()) {
+                  result = { found: true, customer_name: answer.trim(), source: "human_input" };
+                  console.log(`   ✅ Human provided: ${answer.trim()}`);
+                }
+              }
+
+              if (block.name === "lookup_billing_address") {
+                const answer = await askUser(
+                  `\n⚠️  Billing address not found in CRM for ${invoiceNumber}.\n   Enter billing address manually (or press Enter to skip): `
+                );
+                if (answer.trim()) {
+                  result = { found: true, billing_address: answer.trim(), source: "human_input" };
+                  console.log(`   ✅ Human provided: ${answer.trim()}`);
+                }
+              }
+            }
+
             toolResults.push({
               type: "tool_result",
               tool_use_id: block.id,
@@ -157,6 +232,7 @@ async function runAgent(invoiceText) {
       continue;
     }
 
+    // ── UNEXPECTED stop_reason ────────────────────────────────────────────
     console.log(`⚠️  Unexpected stop_reason: ${response.stop_reason}`);
     const outcome = {
       success: false,

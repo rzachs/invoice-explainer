@@ -58,7 +58,7 @@ Total: $5,000
 };
 
 // ─── Change this to "A", "B", or "C" ─────────────────────────────────────────
-const SCENARIO = "B";
+const SCENARIO = "C";
 
 async function main() {
   if (!process.env.ANTHROPIC_API_KEY) {

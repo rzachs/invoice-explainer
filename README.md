@@ -10,13 +10,15 @@ Raw invoice text
 [Agent loop]  Claude analyses the invoice
       ↓ (if customer name or billing address missing)
 [Tool call]   lookup_customer / lookup_billing_address → mock CRM
+      ↓ (if CRM returns { found: false })
+[Human input] Operator prompted to supply missing field manually
       ↓ (loop until end_turn or dead end)
 [end_turn]    Claude produces plain-language explanation
       ↓
 Output: explanation, or halt + flag if data can't be resolved
 ```
 
-Claude decides whether to call tools — the agent loop keeps going while `stop_reason === "tool_use"` and exits when `stop_reason === "end_turn"`. If the CRM has no record, Claude flags the issue instead of guessing.
+Claude decides whether to call tools — the agent loop keeps going while `stop_reason === "tool_use"` and exits when `stop_reason === "end_turn"`. When the CRM has no record, the agent pauses and asks the operator to supply the missing field manually. If the operator provides it, the value is tagged `source: "human_input"` and Claude notes the distinction in its explanation. If the operator skips, Claude flags the missing data instead of guessing.
 
 ## Project structure
 
@@ -66,8 +68,8 @@ Switch between scenarios in `src/index.js` by changing `SCENARIO`:
 | Scenario | Invoice | What happens |
 |---|---|---|
 | `"A"` | INV-1042 — all fields present | No tool calls; Claude explains directly |
-| `"B"` | INV-1043 — customer name and billing address missing | Two tool calls; CRM returns name but no address |
-| `"C"` | INV-1044 — customer name missing, no CRM record | Agent halts and flags the unresolvable field |
+| `"B"` | INV-1043 — customer name and billing address missing | Two tool calls; CRM returns name but not address; operator prompted for address |
+| `"C"` | INV-1044 — customer name missing, no CRM record | Operator prompted for name; if skipped, agent flags the unresolvable field |
 
 ## Tools
 
