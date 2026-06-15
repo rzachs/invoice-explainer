@@ -1,75 +1,88 @@
 /**
  * index.js
  *
- * Full pipeline:
- *   Raw invoice text
- *       ↓
- *   [Claude call 1] Extract → JSON          (extract.js)
- *       ↓
- *   [Deterministic]  Validate + retry loop  (validate.js)
- *       ↓
- *   [Claude call 2]  Explain in plain lang  (explain.js)
- *       ↓
- *   Output to console
+ * Entry point. Runs three invoice scenarios to exercise the full agent:
  *
- * Usage:
- *   ANTHROPIC_API_KEY=sk-ant-... node src/index.js
+ *   Scenario A (INV-1042): All fields present in invoice → 0 tool calls
+ *   Scenario B (INV-1043): Missing customer name → 1 tool call (name found, address missing → 2nd call)
+ *   Scenario C (INV-1044): Missing customer name, no CRM record → halt + flag
+ *
+ * Change SCENARIO below to test each one.
  */
 
-import { extractInvoice } from "./extract.js";
-import { explainInvoice } from "./explain.js";
+require('dotenv').config();
 
-// --- Sample invoice ---
-// Replace this with file input, PDF text extraction, or stdin as needed.
-const SAMPLE_INVOICE = `
-Invoice #1042
-From: Acme Corp
-To: Wayne Enterprises
-Date: 2026-05-01
-Due: 2026-05-30
+const { runAgent } = require("./agent");
 
-- Web design services: $3,200
-- Hosting setup: $400
+// ─── Test invoices ────────────────────────────────────────────────────────────
 
-Total: $3,600
-`;
+const INVOICES = {
+  A: `
+Invoice #INV-1042
+Customer: Wayne Enterprises
+Billing Address: 1007 Mountain Drive, Gotham
+Date: 2026-06-01
+Due: 2026-06-30
 
-// Audience: "business" | "accountant" | "developer"
-const AUDIENCE = "business";
+Items:
+- Security consulting: $8,000
+- Equipment maintenance: $1,200
+
+Total: $9,200
+`,
+
+  B: `
+Invoice #INV-1043
+Date: 2026-06-01
+Due: 2026-06-30
+
+Items:
+- Arc reactor components: $42,000
+- Engineering consultation: $15,000
+
+Total: $57,000
+`,
+// Note: customer name AND billing address missing — should trigger two tool calls
+
+  C: `
+Invoice #INV-1044
+Date: 2026-06-01
+Due: 2026-06-30
+
+Items:
+- Consulting services: $5,000
+
+Total: $5,000
+`,
+// Note: customer name missing, no CRM record — should halt and flag
+};
+
+// ─── Change this to "A", "B", or "C" ─────────────────────────────────────────
+const SCENARIO = "A";
 
 async function main() {
-  // Guard: check API key is set
   if (!process.env.ANTHROPIC_API_KEY) {
-    console.error("Error: ANTHROPIC_API_KEY environment variable is not set.");
-    console.error("Run: export ANTHROPIC_API_KEY=sk-ant-...");
+    console.error("Error: ANTHROPIC_API_KEY not set");
     process.exit(1);
   }
 
-  console.log("=== Invoice Explainer Pipeline ===\n");
+  const invoice = INVOICES[SCENARIO];
+  console.log(`\nRunning Scenario ${SCENARIO}`);
+  console.log("Invoice text:");
+  console.log(invoice);
 
-  // --- Stage 1: Extract ---
-  console.log("[1/2] Extracting...");
-  const extraction = await extractInvoice(SAMPLE_INVOICE);
+  const outcome = await runAgent(invoice);
 
-  if (!extraction.success) {
-    console.error("\nPipeline failed at extraction stage:");
-    console.error(extraction.error);
-    process.exit(1);
+  console.log("\n" + "═".repeat(50));
+  if (outcome.success) {
+    console.log("FINAL EXPLANATION:");
+    console.log("═".repeat(50));
+    console.log(outcome.result);
+  } else {
+    console.log("⚠️  AGENT HALTED — ACTION REQUIRED:");
+    console.log("═".repeat(50));
+    console.log(outcome.result);
   }
-
-  console.log("\nExtracted JSON:");
-  console.log(JSON.stringify(extraction.data, null, 2));
-
-  // --- Stage 2: Explain ---
-  console.log(`\n[2/2] Explaining (audience: ${AUDIENCE})...`);
-  const explanation = await explainInvoice(extraction.data, AUDIENCE);
-
-  console.log("\nPlain language explanation:");
-  console.log("─".repeat(40));
-  console.log(explanation);
-  console.log("─".repeat(40));
-
-  console.log(`\nDone. (${extraction.attempts} extraction attempt(s))`);
 }
 
 main().catch((err) => {
