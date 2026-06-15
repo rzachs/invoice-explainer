@@ -1,31 +1,8 @@
-/**
- * agent.js
- *
- * The agentic layer. This is the new piece that makes invoice-explainer
- * an agent rather than a fixed pipeline.
- *
- * WHAT THIS DOES:
- *   1. Sends the invoice to Claude with two tool definitions
- *   2. Checks stop_reason on every response
- *   3. If "tool_use" → executes the tool, sends result back, loops
- *   4. If "end_turn" → Claude is done, return the final text
- *   5. If Claude flags a dead end → halt and surface the problem
- *
- * THE LOOP CONDITION (from the docs):
- *   while (stop_reason === "tool_use") → keep going
- *   stop_reason === "end_turn"         → done
- *
- * FIXES APPLIED:
- *   #1 — try/catch around client.messages.create()
- *   #3 — validate invoice_number format before hitting the CRM
- */
-
 const Anthropic = require("@anthropic-ai/sdk");
 const { executeTool } = require("./mock-crm");
+const { Logger } = require("./logger");
 
 const client = new Anthropic();
-
-// ─── Tool definitions ────────────────────────────────────────────────────────
 
 const TOOLS = [
   {
@@ -56,11 +33,10 @@ const TOOLS = [
         },
       },
       required: ["invoice_number"],
+      cache_control: { type: "ephemeral" },
     },
   },
 ];
-
-// ─── System prompt ────────────────────────────────────────────────────────────
 
 const SYSTEM_PROMPT = `You are an invoice analysis agent. Your job is to:
 1. Analyse the invoice provided by the user
@@ -69,10 +45,6 @@ const SYSTEM_PROMPT = `You are an invoice analysis agent. Your job is to:
 4. Once you have all available information, produce a clear plain-language explanation of the invoice
 5. If a tool returns { found: false }, clearly flag to the user what is missing and cannot be resolved — do not guess or invent data`;
 
-// ─── Invoice number validation ────────────────────────────────────────────────
-// FIX #3: Claude extracts the invoice number from raw text — we don't control it.
-// Validate before hitting the CRM to catch hallucinated or malformed values.
-
 const INVOICE_NUMBER_FORMAT = /^INV-\d+$/;
 
 function validateInvoiceNumber(invoiceNumber) {
@@ -80,13 +52,12 @@ function validateInvoiceNumber(invoiceNumber) {
   return INVOICE_NUMBER_FORMAT.test(invoiceNumber);
 }
 
-// ─── Agent loop ───────────────────────────────────────────────────────────────
-
 async function runAgent(invoiceText) {
   console.log("\n" + "═".repeat(50));
   console.log("🤖 AGENT STARTING");
   console.log("═".repeat(50));
 
+  const logger = new Logger();
   const messages = [{ role: "user", content: invoiceText }];
 
   let iteration = 0;
@@ -95,22 +66,32 @@ async function runAgent(invoiceText) {
   while (iteration < MAX_ITERATIONS) {
     iteration++;
     console.log(`\n── Loop iteration ${iteration} ──`);
+    logger.logIteration(iteration);
 
-    // FIX #1: wrap API call in try/catch
-    // A 429 (rate limit), 500 (server error), or network failure will throw.
-    // We catch it, log the status code, and fail clean instead of crashing.
+    // Log exactly what we're about to send
+    logger.logRequest({
+      model: "claude-sonnet-4-6",
+      system: SYSTEM_PROMPT,
+      tools: TOOLS,
+      messages,
+    });
+
     let response;
     try {
-      response = await client.messages.create({
+      const stream = client.messages.stream({
         model: "claude-sonnet-4-6",
         max_tokens: 1024,
         system: SYSTEM_PROMPT,
         tools: TOOLS,
         messages,
       });
+
+      stream.on("text", (text) => {
+        process.stdout.write(text);
+      });
+
+      response = await stream.finalMessage();
     } catch (err) {
-      // err.status is the HTTP status code from the Anthropic SDK
-      // Useful later if you want to add retry logic for 429 vs 400
       console.error(`\n❌ Anthropic API error: ${err.status} — ${err.message}`);
       return {
         success: false,
@@ -118,9 +99,11 @@ async function runAgent(invoiceText) {
       };
     }
 
-    console.log(`stop_reason: ${response.stop_reason}`);
+    // Log exactly what came back
+    logger.logResponse(response);
 
-    // ── EXIT CONDITION 1: Claude is done ──────────────────────────────────
+    console.log(`\nstop_reason: ${response.stop_reason}`);
+
     if (response.stop_reason === "end_turn") {
       const finalText = response.content
         .filter((b) => b.type === "text")
@@ -128,10 +111,11 @@ async function runAgent(invoiceText) {
         .join("\n");
 
       console.log("\n✅ Agent finished (end_turn)");
-      return { success: true, result: finalText };
+      const outcome = { success: true, result: finalText };
+      logger.logEnd(outcome);
+      return outcome;
     }
 
-    // ── TOOL USE: Claude wants to call a tool ─────────────────────────────
     if (response.stop_reason === "tool_use") {
       messages.push({ role: "assistant", content: response.content });
 
@@ -144,9 +128,6 @@ async function runAgent(invoiceText) {
 
           const invoiceNumber = block.input.invoice_number;
 
-          // FIX #3: validate invoice number format before hitting the CRM.
-          // If Claude hallucinated or misread the number, we catch it here
-          // and send an error result back instead of a silent { found: false }.
           if (!validateInvoiceNumber(invoiceNumber)) {
             console.log(`   ⚠️  Invalid invoice number: "${invoiceNumber}" — skipping CRM call`);
             toolResults.push({
@@ -157,7 +138,6 @@ async function runAgent(invoiceText) {
               }),
             });
           } else {
-            // Invoice number looks valid — safe to hit the CRM
             const result = executeTool(block.name, block.input);
             console.log(`   Result: ${JSON.stringify(result)}`);
             toolResults.push({
@@ -177,19 +157,21 @@ async function runAgent(invoiceText) {
       continue;
     }
 
-    // ── UNEXPECTED stop_reason ────────────────────────────────────────────
     console.log(`⚠️  Unexpected stop_reason: ${response.stop_reason}`);
-    return {
+    const outcome = {
       success: false,
       result: `Agent stopped unexpectedly: ${response.stop_reason}`,
     };
+    logger.logEnd(outcome);
+    return outcome;
   }
 
-  return {
+  const outcome = {
     success: false,
     result: `Agent exceeded maximum iterations (${MAX_ITERATIONS}). Something may be looping.`,
   };
+  logger.logEnd(outcome);
+  return outcome;
 }
 
 module.exports = { runAgent };
-

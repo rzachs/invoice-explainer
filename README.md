@@ -25,7 +25,9 @@ invoice-explainer/
 ├── src/
 │   ├── index.js      # Entry point — three test scenarios, SCENARIO switch
 │   ├── agent.js      # Agent loop: tool dispatch, message history, exit conditions
-│   └── mock-crm.js   # Simulated CRM with lookup_customer / lookup_billing_address tools
+│   ├── mock-crm.js   # Simulated CRM with lookup_customer / lookup_billing_address tools
+│   └── logger.js     # Writes full API request/response payloads to logs/ per run
+├── logs/             # Debug logs, one file per run (git-ignored)
 ├── package.json
 ├── .env               # ANTHROPIC_API_KEY goes here (not committed)
 ├── .gitignore
@@ -75,6 +77,16 @@ Switch between scenarios in `src/index.js` by changing `SCENARIO`:
 | `lookup_billing_address` | Billing address absent from invoice | `{ found, billing_address? }` |
 
 Both tools dispatch through `executeTool()` in `mock-crm.js`. In production, replace the mock CRM object with real database queries.
+
+The agent validates invoice number format (`INV-` followed by digits) before calling any tool. An invalid format returns an error result to Claude instead of hitting the CRM.
+
+## Debug logs
+
+Each run writes a timestamped log file to `logs/debug-TIMESTAMP.log` containing the full API payload for every loop iteration — request (model, system prompt, tools, full message history) and response (stop reason, token usage including cache hits, content blocks). Nothing in the logs is printed to the console; the log path is shown at startup.
+
+```
+📝 Logging to: logs/debug-2026-06-15T20-44-11-357Z.log
+```
 
 ## References
 
