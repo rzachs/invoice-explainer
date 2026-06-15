@@ -1,31 +1,33 @@
 # Invoice Explainer
 
-A two-call Claude pipeline that extracts structured data from invoice text and explains it in plain language.
+An invoice analysis agent that uses Claude tool use to look up missing customer data from a CRM before producing a plain-language explanation.
 
-## Pipeline
+## How it works
 
 ```
 Raw invoice text
       ↓
-[Claude call 1]  Extract → JSON        retry loop up to 3x
+[Agent loop]  Claude analyses the invoice
+      ↓ (if customer name or billing address missing)
+[Tool call]   lookup_customer / lookup_billing_address → mock CRM
+      ↓ (loop until end_turn or dead end)
+[end_turn]    Claude produces plain-language explanation
       ↓
-[Deterministic]  Validate              required fields, types, math, dates
-      ↓
-[Claude call 2]  Explain in plain      audience-aware
-      ↓
-Output
+Output: explanation, or halt + flag if data can't be resolved
 ```
+
+Claude decides whether to call tools — the agent loop keeps going while `stop_reason === "tool_use"` and exits when `stop_reason === "end_turn"`. If the CRM has no record, Claude flags the issue instead of guessing.
 
 ## Project structure
 
 ```
 invoice-explainer/
 ├── src/
-│   ├── index.js      # Entry point — wires the full pipeline
-│   ├── extract.js    # Claude call 1: extraction + retry loop
-│   ├── explain.js    # Claude call 2: plain language explanation
-│   └── validate.js   # Deterministic validation layer
+│   ├── index.js       # Entry point — three test scenarios, SCENARIO switch
+│   ├── agent.js       # Agent loop: tool dispatch, message history, exit conditions
+│   └── mock-crm.js    # Simulated CRM with lookup_customer / lookup_billing_address tools
 ├── package.json
+├── .env               # ANTHROPIC_API_KEY goes here (not committed)
 ├── .gitignore
 └── README.md
 ```
@@ -40,45 +42,42 @@ npm install
 
 ### 2. Set your API key
 
-Get your key from [console.anthropic.com](https://console.anthropic.com/settings/keys).
+Create a `.env` file in the project root:
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+```
+ANTHROPIC_API_KEY=sk-ant-...
 ```
 
-Never hardcode the key. Never commit it to git (see `.gitignore`).
+Get your key from [console.anthropic.com](https://console.anthropic.com/settings/keys). Never commit it to git.
 
 ### 3. Run
 
 ```bash
-npm start
+npm start        # run once
+npm run dev      # auto-restart on file save
 ```
 
-## Concepts covered
+## Test scenarios
 
-| Layer | File | What it does |
+Switch between scenarios in `src/index.js` by changing `SCENARIO`:
+
+| Scenario | Invoice | What happens |
 |---|---|---|
-| LLM extraction | `extract.js` | Handles variable invoice formats Claude hasn't seen |
-| Retry loop | `extract.js` | Feeds validation errors back to Claude for self-correction |
-| Deterministic validation | `validate.js` | Required fields, type checks, math verification, date logic |
-| LLM explanation | `explain.js` | Audience-aware plain language output |
+| `"A"` | INV-1042 — all fields present | No tool calls; Claude explains directly |
+| `"B"` | INV-1043 — customer name and billing address missing | Two tool calls; CRM returns name but no address |
+| `"C"` | INV-1044 — customer name missing, no CRM record | Agent halts and flags the unresolvable field |
 
-## Changing the audience
+## Tools
 
-In `src/index.js`, set `AUDIENCE` to one of:
-- `"business"` — non-technical owner, highlights action items
-- `"accountant"` — precise, flags bookkeeping anomalies  
-- `"developer"` — terse, highlights data pipeline issues
+| Tool | When Claude calls it | Returns |
+|---|---|---|
+| `lookup_customer` | Customer name absent from invoice | `{ found, customer_name? }` |
+| `lookup_billing_address` | Billing address absent from invoice | `{ found, billing_address? }` |
 
-## Next steps
-
-- Add PDF text extraction (`npm install pdf-parse`)
-- Add image invoice support (pass base64 to Claude's vision API)
-- Add batch processing for multiple invoices
-- Add a web UI (see the React artifact version)
+Both tools dispatch through `executeTool()` in `mock-crm.js`. In production, replace the mock CRM object with real database queries.
 
 ## References
 
 - [Claude API docs](https://docs.claude.com)
-- [Anthropic cookbook](https://github.com/anthropics/anthropic-cookbook)
+- [Tool use guide](https://docs.anthropic.com/en/docs/build-with-claude/tool-use)
 - [Messages API reference](https://docs.claude.com/en/api/messages)
