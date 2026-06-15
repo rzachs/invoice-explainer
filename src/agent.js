@@ -14,6 +14,10 @@
  * THE LOOP CONDITION (from the docs):
  *   while (stop_reason === "tool_use") → keep going
  *   stop_reason === "end_turn"         → done
+ *
+ * FIXES APPLIED:
+ *   #1 — try/catch around client.messages.create()
+ *   #3 — validate invoice_number format before hitting the CRM
  */
 
 const Anthropic = require("@anthropic-ai/sdk");
@@ -22,8 +26,6 @@ const { executeTool } = require("./mock-crm");
 const client = new Anthropic();
 
 // ─── Tool definitions ────────────────────────────────────────────────────────
-// These are what Claude reads to know what tools exist and when to use them.
-// The description is critical — it's Claude's instructions for when to call it.
 
 const TOOLS = [
   {
@@ -59,7 +61,6 @@ const TOOLS = [
 ];
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-// Tells Claude its role and what to do when it hits a dead end.
 
 const SYSTEM_PROMPT = `You are an invoice analysis agent. Your job is to:
 1. Analyse the invoice provided by the user
@@ -68,6 +69,17 @@ const SYSTEM_PROMPT = `You are an invoice analysis agent. Your job is to:
 4. Once you have all available information, produce a clear plain-language explanation of the invoice
 5. If a tool returns { found: false }, clearly flag to the user what is missing and cannot be resolved — do not guess or invent data`;
 
+// ─── Invoice number validation ────────────────────────────────────────────────
+// FIX #3: Claude extracts the invoice number from raw text — we don't control it.
+// Validate before hitting the CRM to catch hallucinated or malformed values.
+
+const INVOICE_NUMBER_FORMAT = /^INV-\d+$/;
+
+function validateInvoiceNumber(invoiceNumber) {
+  if (!invoiceNumber) return false;
+  return INVOICE_NUMBER_FORMAT.test(invoiceNumber);
+}
+
 // ─── Agent loop ───────────────────────────────────────────────────────────────
 
 async function runAgent(invoiceText) {
@@ -75,25 +87,36 @@ async function runAgent(invoiceText) {
   console.log("🤖 AGENT STARTING");
   console.log("═".repeat(50));
 
-  // messages is the full conversation history.
-  // Claude has no memory — we send everything every time.
   const messages = [{ role: "user", content: invoiceText }];
 
   let iteration = 0;
-  const MAX_ITERATIONS = 10; // safety ceiling — prevents infinite loops
+  const MAX_ITERATIONS = 10;
 
   while (iteration < MAX_ITERATIONS) {
     iteration++;
     console.log(`\n── Loop iteration ${iteration} ──`);
 
-    // Send current conversation to Claude
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1024,
-      system: SYSTEM_PROMPT,
-      tools: TOOLS,
-      messages,
-    });
+    // FIX #1: wrap API call in try/catch
+    // A 429 (rate limit), 500 (server error), or network failure will throw.
+    // We catch it, log the status code, and fail clean instead of crashing.
+    let response;
+    try {
+      response = await client.messages.create({
+        model: "claude-sonnet-4-6",
+        max_tokens: 1024,
+        system: SYSTEM_PROMPT,
+        tools: TOOLS,
+        messages,
+      });
+    } catch (err) {
+      // err.status is the HTTP status code from the Anthropic SDK
+      // Useful later if you want to add retry logic for 429 vs 400
+      console.error(`\n❌ Anthropic API error: ${err.status} — ${err.message}`);
+      return {
+        success: false,
+        result: `API error (${err.status ?? "unknown"}): ${err.message}`,
+      };
+    }
 
     console.log(`stop_reason: ${response.stop_reason}`);
 
@@ -110,10 +133,8 @@ async function runAgent(invoiceText) {
 
     // ── TOOL USE: Claude wants to call a tool ─────────────────────────────
     if (response.stop_reason === "tool_use") {
-      // Add Claude's response (including tool_use blocks) to history
       messages.push({ role: "assistant", content: response.content });
 
-      // Collect all tool results — Claude may request multiple tools at once
       const toolResults = [];
 
       for (const block of response.content) {
@@ -121,28 +142,38 @@ async function runAgent(invoiceText) {
           console.log(`\n🔧 Claude requests tool: ${block.name}`);
           console.log(`   Input: ${JSON.stringify(block.input)}`);
 
-          // YOUR CODE runs the actual function — Claude never touches the DB
-          const result = executeTool(block.name, block.input);
-          console.log(`   Result: ${JSON.stringify(result)}`);
+          const invoiceNumber = block.input.invoice_number;
 
-          // Package result in the format the API expects
-          toolResults.push({
-            type: "tool_result",
-            tool_use_id: block.id, // must match the id Claude generated
-            content: JSON.stringify(result),
-          });
+          // FIX #3: validate invoice number format before hitting the CRM.
+          // If Claude hallucinated or misread the number, we catch it here
+          // and send an error result back instead of a silent { found: false }.
+          if (!validateInvoiceNumber(invoiceNumber)) {
+            console.log(`   ⚠️  Invalid invoice number: "${invoiceNumber}" — skipping CRM call`);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify({
+                error: `Invalid invoice number format: "${invoiceNumber}". Expected format: INV-followed by digits (e.g. INV-1042)`,
+              }),
+            });
+          } else {
+            // Invoice number looks valid — safe to hit the CRM
+            const result = executeTool(block.name, block.input);
+            console.log(`   Result: ${JSON.stringify(result)}`);
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: block.id,
+              content: JSON.stringify(result),
+            });
+          }
         }
 
-        // Print any reasoning text Claude produces before tool calls
         if (block.type === "text" && block.text.trim()) {
           console.log(`\n💭 Claude reasoning: ${block.text}`);
         }
       }
 
-      // Send tool results back — this is what closes the loop
       messages.push({ role: "user", content: toolResults });
-
-      // Loop continues — Claude will now reason about the results
       continue;
     }
 
@@ -154,7 +185,6 @@ async function runAgent(invoiceText) {
     };
   }
 
-  // ── EXIT CONDITION 2: Hit safety ceiling ──────────────────────────────────
   return {
     success: false,
     result: `Agent exceeded maximum iterations (${MAX_ITERATIONS}). Something may be looping.`,
@@ -162,3 +192,4 @@ async function runAgent(invoiceText) {
 }
 
 module.exports = { runAgent };
+

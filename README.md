@@ -23,9 +23,9 @@ Claude decides whether to call tools — the agent loop keeps going while `stop_
 ```
 invoice-explainer/
 ├── src/
-│   ├── index.js       # Entry point — three test scenarios, SCENARIO switch
-│   ├── agent.js       # Agent loop: tool dispatch, message history, exit conditions
-│   └── mock-crm.js    # Simulated CRM with lookup_customer / lookup_billing_address tools
+│   ├── index.js      # Entry point — three test scenarios, SCENARIO switch
+│   ├── agent.js      # Agent loop: tool dispatch, message history, exit conditions
+│   └── mock-crm.js   # Simulated CRM with lookup_customer / lookup_billing_address tools
 ├── package.json
 ├── .env               # ANTHROPIC_API_KEY goes here (not committed)
 ├── .gitignore
